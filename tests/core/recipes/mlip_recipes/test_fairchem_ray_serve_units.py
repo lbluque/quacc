@@ -5,7 +5,7 @@ run without HF_TOKEN, without a real Ray cluster, and without actually
 loading any UMA checkpoint. They cover the small but easy-to-miss
 branches in ``pick_calculator``: the two fallback paths (Ray missing,
 Ray uninitialized) and the alternative model-identifier kwarg paths
-(``model_id``/``checkpoint``).
+(``model_id``/``checkpoint``), plus construction of the typed ``ModelSpec``.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import pytest
 pytest.importorskip("fairchem")
 pytest.importorskip("fairchem.core")
 pytest.importorskip("ray")
+
+from fairchem.core.components.batch_server import ModelSpec
 
 from quacc import get_settings
 from quacc.recipes.mlip._base import pick_calculator
@@ -74,8 +76,11 @@ def test_falls_back_when_ray_not_installed(monkeypatch, caplog):
         ) as mock_local,
         caplog.at_level("WARNING"),
     ):
-        pick_calculator(library="fairchem", name_or_path="uma-s-1p1-fallback")
+        pick_calculator(
+            library="fairchem", name_or_path="uma-s-1p1-fallback", source="registry"
+        )
     mock_local.assert_called_once()
+    assert "source" not in mock_local.call_args.kwargs
     assert "Ray is not installed" in caplog.text
 
 
@@ -101,6 +106,7 @@ def stub_serve_unit():
     with (
         patch(
             "fairchem.core.units.mlip_unit.predict.BatchServerPredictUnit.from_deployment_connection_info",
+            autospec=True,
             side_effect=_capture,
         ),
         patch(
@@ -114,14 +120,18 @@ def stub_serve_unit():
 
 
 @pytest.mark.usefixtures("enable_batching")
-def test_serve_branch_uses_name_or_path(monkeypatch, stub_serve_unit):
+def test_serve_branch_uses_name_or_path(monkeypatch, stub_serve_unit, tmp_path):
     import ray
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
-    pick_calculator(
-        library="fairchem", name_or_path="my/local/ckpt.pt", task_name="oc20"
-    )
-    assert stub_serve_unit["multiplexed_model_id"] == "my/local/ckpt.pt:default"
+    checkpoint = tmp_path / "ckpt.pt"
+    checkpoint.touch()
+    pick_calculator(library="fairchem", name_or_path=checkpoint, task_name="oc20")
+    model_spec = stub_serve_unit["model_spec"]
+    assert isinstance(model_spec, ModelSpec)
+    assert model_spec.checkpoint == str(checkpoint)
+    assert model_spec.source == "path"
+    assert model_spec.model_id == ModelSpec(str(checkpoint)).model_id
     assert stub_serve_unit["deployment_name"] == "multiplexed-predict-server"
 
 
@@ -133,10 +143,29 @@ def test_serve_branch_uses_model_id(monkeypatch, stub_serve_unit):
     pick_calculator(
         library="fairchem",
         model_id="uma-s-2",
-        inference_settings="fast",
+        inference_settings="turbo",
         task_name="omat",
     )
-    assert stub_serve_unit["multiplexed_model_id"] == "uma-s-2:fast"
+    assert (
+        stub_serve_unit["model_spec"].model_id
+        == ModelSpec("uma-s-2", inference_settings="turbo").model_id
+    )
+
+
+@pytest.mark.usefixtures("enable_batching")
+def test_serve_branch_uses_checkpoint_alias(monkeypatch, stub_serve_unit):
+    import ray
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    pick_calculator(
+        library="fairchem",
+        checkpoint="s3://models/uma.pt",
+        source="path",
+        task_name="omat",
+    )
+    model_spec = stub_serve_unit["model_spec"]
+    assert model_spec.checkpoint == "s3://models/uma.pt"
+    assert model_spec.source == "path"
 
 
 @pytest.mark.usefixtures("enable_batching")
@@ -146,27 +175,33 @@ def test_serve_branch_default_checkpoint(monkeypatch, stub_serve_unit):
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     # Neither name_or_path, model_id, nor checkpoint provided → default
     pick_calculator(library="fairchem", task_name="omat")
-    assert stub_serve_unit["multiplexed_model_id"] == "uma-s-1p1:default"
+    assert stub_serve_unit["model_spec"].model_id == ModelSpec("uma-s-1p1").model_id
 
 
 @pytest.mark.usefixtures("enable_batching")
-def test_serve_branch_drops_local_only_kwargs(monkeypatch, stub_serve_unit):
-    """``device``/``overrides``/``seed`` must be stripped before reaching
-    the Ray Serve helper (it doesn't accept them)."""
+def test_serve_branch_propagates_model_loading_kwargs(
+    monkeypatch, stub_serve_unit, caplog
+):
+    """Model-loading kwargs are represented in the remote model spec."""
     import ray
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
-    # If the kwargs were not popped, FAIRChemCalculator stub would
-    # receive them and the test would still pass — but the important
-    # thing is that the serve helper itself doesn't get them. The
-    # fixture's _capture only collects deployment_name/multiplexed_model_id,
-    # so it implicitly verifies no extra kwargs leak through.
-    pick_calculator(
-        library="fairchem",
-        name_or_path="uma-s-1p1",
-        task_name="omat",
-        device="cpu",
-        overrides={"foo": 1},
-        seed=42,
+    with caplog.at_level("WARNING"):
+        pick_calculator(
+            library="fairchem",
+            name_or_path="uma-s-1p1",
+            task_name="omat",
+            inference_settings="turbo",
+            device="cpu",
+            overrides={"foo": 1},
+            seed=42,
+            workers=2,
+        )
+
+    model_spec = stub_serve_unit["model_spec"]
+    expected = ModelSpec(
+        "uma-s-1p1", inference_settings="turbo", device="cpu", overrides={"foo": 1}
     )
-    assert stub_serve_unit["multiplexed_model_id"] == "uma-s-1p1:default"
+    assert model_spec.canonical_dict() == expected.canonical_dict()
+    assert "'seed' argument is ignored" in caplog.text
+    assert "'workers' argument is ignored" in caplog.text

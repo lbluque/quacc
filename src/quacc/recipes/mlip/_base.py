@@ -81,6 +81,11 @@ def pick_calculator(
             - Optional: `inference_settings`, `overrides`, `device`, and
               `workers`; see `FAIRChemCalculator.from_model_checkpoint` for
               details.
+            - When Ray Serve batching is enabled, `source` can be set to
+              `"path"` or `"registry"` to override automatic checkpoint
+              resolution. `workers` values other than 1 and the deprecated
+              `seed` argument are ignored with a warning because model loading
+              happens in the Serve deployment.
             - Downloading gated checkpoints requires Hugging Face
               authentication.
         - `matcalc`:
@@ -159,41 +164,55 @@ def pick_calculator(
             # is expected to already be running on the cluster (typically started
             # by get_local_inference_raycluster / get_slurm_inference_raycluster with
             # setup_multiplexed_batch_predict_server). We connect by deployment
-            # name and route requests to the appropriate model via the
-            # multiplexed_model_id, which has the form
-            # "<checkpoint_name_or_path>:<inference_settings>".
+            # name and route requests to the appropriate model via a typed
+            # ModelSpec. Its deterministic model_id includes all settings that
+            # affect how the model is loaded.
+            from fairchem.core.components.batch_server import ModelSpec
             from fairchem.core.units.mlip_unit.predict import BatchServerPredictUnit
 
             calc_kwargs = calc_kwargs.copy()  # Don't modify the original kwargs
 
-            # Determine model identifier: prefer name_or_path (local checkpoint)
-            # over model_id/checkpoint
+            # Preserve the legacy checkpoint aliases and their precedence.
             name_or_path = calc_kwargs.pop("name_or_path", None)
             if name_or_path is not None:
-                checkpoint_id = str(name_or_path)
+                checkpoint = name_or_path
             else:
-                checkpoint_id = calc_kwargs.pop("model_id", None) or calc_kwargs.pop(
+                checkpoint = calc_kwargs.pop("model_id", None) or calc_kwargs.pop(
                     "checkpoint", "uma-s-1p1"
                 )
 
-            inference_settings = calc_kwargs.pop("inference_settings", "default")
             task_name = calc_kwargs.pop("task_name")
+            seed = calc_kwargs.pop("seed", None)
+            workers = calc_kwargs.pop("workers", 1)
+            if seed is not None:
+                LOGGER.warning(
+                    "The deprecated 'seed' argument is ignored when using FairChem "
+                    "Ray Serve batching because the model is loaded by the deployment."
+                )
+            if workers != 1:
+                LOGGER.warning(
+                    "The 'workers' argument is ignored when using FairChem Ray Serve "
+                    "batching; configure deployment replicas and GPU resources instead."
+                )
 
-            # Drop kwargs only meaningful when loading the checkpoint locally
-            calc_kwargs.pop("device", None)
-            calc_kwargs.pop("overrides", None)
-            calc_kwargs.pop("seed", None)
-
-            multiplexed_model_id = f"{checkpoint_id}:{inference_settings}"
+            model_spec = ModelSpec(
+                checkpoint=str(checkpoint),
+                inference_settings=calc_kwargs.pop("inference_settings", "default"),
+                device=calc_kwargs.pop("device", None),
+                overrides=calc_kwargs.pop("overrides", None),
+                source=calc_kwargs.pop("source", "auto"),
+            )
 
             mlip_unit = BatchServerPredictUnit.from_deployment_connection_info(
-                deployment_name="multiplexed-predict-server",
-                multiplexed_model_id=multiplexed_model_id,
+                deployment_name="multiplexed-predict-server", model_spec=model_spec
             )
 
             calc = FAIRChemCalculator(predict_unit=mlip_unit, task_name=task_name)
         else:
             # Use local inference
+            # ``source`` only disambiguates the multiplexed server loader;
+            # local inference retains FAIRChem's name-or-existing-file lookup.
+            calc_kwargs.pop("source", None)
             calc = FAIRChemCalculator.from_model_checkpoint(**calc_kwargs)
 
     else:
