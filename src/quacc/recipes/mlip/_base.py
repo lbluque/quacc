@@ -167,7 +167,7 @@ def pick_calculator(
             # name and route requests to the appropriate model via a typed
             # ModelSpec. Its deterministic model_id includes all settings that
             # affect how the model is loaded.
-            from fairchem.core.components.batch_server import ModelSpec
+            from fairchem.core.calculate import ModelSpec
             from fairchem.core.units.mlip_unit.predict import BatchServerPredictUnit
 
             calc_kwargs = calc_kwargs.copy()  # Don't modify the original kwargs

@@ -19,7 +19,7 @@ pytest.importorskip("fairchem")
 pytest.importorskip("fairchem.core")
 pytest.importorskip("ray")
 
-from fairchem.core.components.batch_server import ModelSpec
+from fairchem.core.calculate import ModelSpec
 
 from quacc import get_settings
 from quacc.recipes.mlip._base import pick_calculator
